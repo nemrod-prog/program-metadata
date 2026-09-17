@@ -9,12 +9,12 @@ import {
     address,
     ClientWithRpc,
     ClientWithTransactionPlanning,
+    ClientWithTransactionSending,
     Commitment,
     compileTransaction,
     createClient,
     createKeyPairSignerFromBytes,
     createNoopSigner,
-    createSolanaRpc,
     createSolanaRpcSubscriptions,
     extendClient,
     flattenTransactionPlan,
@@ -32,10 +32,14 @@ import {
     SolanaRpcSubscriptionsApi,
     TransactionMessage,
     TransactionPlan,
-    TransactionPlanExecutor,
     TransactionSigner,
 } from '@solana/kit';
-import { solanaRpc } from '@solana/kit-plugin-rpc';
+import {
+    rpcGetMinimumBalance,
+    rpcTransactionPlanner,
+    rpcTransactionPlanSendingExecutor,
+    TransactionPlannerConfig,
+} from '@solana/kit-plugin-rpc';
 import { identity, payer } from '@solana/kit-plugin-signer';
 import { Command } from 'commander';
 import picocolors from 'picocolors';
@@ -56,6 +60,7 @@ import {
     RpcOption,
     WriteOptions,
 } from './options';
+import { createRetryingSolanaRpc, RetryingRpcConfig } from './rpc';
 
 const LOCALHOST_URL = 'http://127.0.0.1:8899';
 const DATA_SOURCE_OPTIONS =
@@ -85,19 +90,51 @@ export async function getClient(options: GlobalOptions) {
     const rpcSubscriptionsUrl = getRpcSubscriptionsUrl(rpcUrl, configs);
     const [identitySigner, payerSigner] = await getKeyPairSigners(options, configs);
 
+    // We build the RPC connection ourselves rather than using the all-in-one
+    // `solanaRpc` plugin because that plugin does not expose a hook for a custom
+    // transport, and we need a transport that retries on HTTP 429 responses to
+    // survive rate-limited endpoints. We therefore attach our retrying RPC (and
+    // its subscriptions) directly and apply the RPC plugin's constituents.
+    const rpc = createRetryingSolanaRpc(rpcUrl, getRetryingRpcConfig());
+    const rpcSubscriptions = createSolanaRpcSubscriptions(rpcSubscriptionsUrl);
+    const transactionConfig = getTransactionConfig(options);
+
     return createClient()
         .use(payer(payerSigner))
         .use(identity(identitySigner))
-        .use(
-            solanaRpc({
-                rpcUrl,
-                rpcSubscriptionsUrl,
-                transactionConfig: { microLamportsPerComputeUnit: options.priorityFees },
-            }),
-        )
+        .use(client => extendClient(client, { rpc, rpcSubscriptions }))
+        .use(rpcGetMinimumBalance())
+        .use(rpcTransactionPlanner(transactionConfig))
+        .use(rpcTransactionPlanSendingExecutor({ estimateResourceLimits: transactionConfig.estimateResourceLimits }))
         .use(programMetadataProgram())
         .use(cliConfigs(configs))
         .use(cliRunOrExport(options));
+}
+
+/**
+ * Shared configuration for the CLI's retrying RPC. Surfaces a warning whenever a
+ * request is rate limited and retried, so a paused command does not appear to
+ * hang. Used by both {@link getClient} and {@link getReadonlyClient}.
+ */
+function getRetryingRpcConfig(): RetryingRpcConfig {
+    return {
+        onRetry: ({ delayMs }) =>
+            logWarning(`RPC rate limited (HTTP 429), retrying in ${(delayMs / 1000).toFixed(1)}s...`),
+    };
+}
+
+/**
+ * Builds the transaction planner config for the requested transaction version.
+ * The config shape is discriminated by `version`: legacy and version 0
+ * transactions express priority fees per compute unit, while version 1 will
+ * use a total fee in lamports.
+ */
+function getTransactionConfig(options: GlobalOptions): TransactionPlannerConfig {
+    switch (options.txVersion) {
+        case 'legacy':
+        case 0:
+            return { microLamportsPerComputeUnit: options.priorityFees, version: options.txVersion };
+    }
 }
 
 /**
@@ -117,10 +154,7 @@ function cliConfigs(configs: SolanaConfigs) {
  */
 function cliRunOrExport(options: ExportOption & ExportEncodingOption) {
     return <
-        T extends ClientWithRpc<GetLatestBlockhashApi> &
-            ClientWithTransactionPlanning & {
-                transactionPlanExecutor: TransactionPlanExecutor;
-            },
+        T extends ClientWithRpc<GetLatestBlockhashApi> & ClientWithTransactionPlanning & ClientWithTransactionSending,
     >(
         client: T,
     ) =>
@@ -130,8 +164,8 @@ function cliRunOrExport(options: ExportOption & ExportEncodingOption) {
                 if (options.export) {
                     await exportTransactionPlan(transactionPlan, client, options);
                 } else {
-                    // TODO: progress + error handling.
-                    await client.transactionPlanExecutor(transactionPlan);
+                    // TODO: progress reporting.
+                    await client.sendTransactions(transactionPlan);
                     logSuccess('Operation executed successfully');
                 }
             },
@@ -202,7 +236,7 @@ export function getReadonlyClient(options: RpcOption): ReadonlyClient {
     const rpcSubscriptionsUrl = getRpcSubscriptionsUrl(rpcUrl, configs);
     return {
         configs,
-        rpc: createSolanaRpc(rpcUrl),
+        rpc: createRetryingSolanaRpc(rpcUrl, getRetryingRpcConfig()),
         rpcSubscriptions: createSolanaRpcSubscriptions(rpcSubscriptionsUrl),
     };
 }
